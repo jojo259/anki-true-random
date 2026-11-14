@@ -73,6 +73,10 @@ def on_operation(changes, handler) -> None:
             session.invalidate(force_id=session.force_id)
 
 
+def on_show(card) -> None:
+    session_for(card.col.sched).shown(card.col, card)
+
+
 def install() -> None:
     global _installed
     install_scheduler()
@@ -81,4 +85,5 @@ def install() -> None:
         gui_hooks.filtered_deck_dialog_will_add_or_update_deck.append(on_will_save)
         gui_hooks.filtered_deck_dialog_did_add_or_update_deck.append(on_saved)
         gui_hooks.operation_did_execute.append(on_operation)
+        gui_hooks.reviewer_did_show_question.append(on_show)
         _installed = True

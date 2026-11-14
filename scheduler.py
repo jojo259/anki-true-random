@@ -33,7 +33,18 @@ def set_enabled(col, deck_id: int, enabled: bool, *, undoable: bool = False) -> 
         ids.discard(str(deck_id))
     # This config API preserves the existing undo history.
     col.set_config(CONFIG_KEY, sorted(ids), undoable=undoable)
-    session_for(col.sched).invalidate()
+    session = session_for(col.sched)
+    session.pending.pop(deck_id, None)
+    session.invalidate()
+
+
+def resume_state(col, cid):
+    """Scheduling identity, excluding text edits and unchanged-card saves."""
+    row = col.db.first(
+        'select id, did, type, queue, due, ivl, factor, reps, lapses, left, odue, odid '
+        'from cards where id = ?', cid,
+    )
+    return tuple(row) if row else None
 
 
 def ready(queued, now: int) -> bool:
@@ -57,6 +68,21 @@ class Session:
     signature: tuple | None = None
     force_id: int | None = None
     answers: dict[int, int] = field(default_factory=dict)
+    pending: dict[int, tuple] = field(default_factory=dict)
+
+    def shown(self, col, card):
+        # Record the card actually displayed, including a choice made by any
+        # other reviewer add-on. Queue/count queries alone are not a display.
+        did = col.decks.current()['id']
+        if is_enabled(col, did) and card.did == did:
+            state = resume_state(col, card.id)
+            if state:
+                self.pending[did] = state
+
+    def forget(self, cid):
+        for did, state in list(self.pending.items()):
+            if state[0] == cid:
+                del self.pending[did]
 
     def invalidate(self, force_id: int | None = None) -> None:
         self.order.clear()
@@ -73,6 +99,10 @@ class Session:
         now = int(time.time())
         candidates = [q for q in native.cards if ready(q, now)]
         by_id = {q.card.id: q for q in candidates}
+        pending = self.pending.get(deck_id)
+        if pending and (pending[0] not in by_id or resume_state(col, pending[0]) != pending):
+            del self.pending[deck_id]
+            pending = None
         signature = (
             deck_id,
             col._backend.get_undo_status().last_step,
@@ -88,9 +118,10 @@ class Session:
                 self.order.remove(first)
                 self.order.insert(0, first)
             self.signature = signature
-        if self.force_id in by_id:
-            self.order.remove(self.force_id)
-            self.order.insert(0, self.force_id)
+        preferred = self.force_id if self.force_id in by_id else pending[0] if pending else None
+        if preferred is not None:
+            self.order.remove(preferred)
+            self.order.insert(0, preferred)
             self.force_id = None
 
         out = QueuedCards()
@@ -137,6 +168,7 @@ class Session:
         # Native undo history is bounded; avoid retaining unlimited session data.
         if len(self.answers) > 100:
             self.answers.pop(next(iter(self.answers)))
+        self.forget(card.id)
         self.invalidate()
         return changes
 
@@ -175,12 +207,15 @@ def install_scheduler() -> None:
     def undo(self):
         out = original_undo(self)
         session = session_for(self.sched)
+        session.pending.pop(self.decks.current()['id'], None)
         session.invalidate(force_id=session.answers.get(out.counter))
         return out
 
     def redo(self):
         out = original_redo(self)
-        session_for(self.sched).invalidate()
+        session = session_for(self.sched)
+        session.pending.pop(self.decks.current()['id'], None)
+        session.invalidate()
         return out
 
     get_queued_cards._true_random = True

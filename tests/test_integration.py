@@ -34,6 +34,8 @@ from anki.collection import Collection
 from anki.cards import Card
 from anki.decks import FilteredDeckConfig
 from anki.scheduler.v3 import Scheduler, CardAnswer
+import aqt
+from aqt import gui_hooks
 import anki.lang
 anki.lang.set_lang('en')
 
@@ -47,12 +49,16 @@ sys.modules[spec.name] = engine
 spec.loader.exec_module(engine)
 native_get = Scheduler.get_queued_cards
 engine.install_scheduler()
+from true_random_test_package import addon
+addon.install()
 
 
 class Integration(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        workspace = ROOT.parents[1] / 'work'
+        self.tmp = tempfile.TemporaryDirectory(dir=workspace if workspace.exists() else None)
         self.col = Collection(str(Path(self.tmp.name) / 'collection.anki2'))
+        aqt.mw = types.SimpleNamespace(col=self.col)
         self.ids = []
         for index in range(12):
             note = self.col.new_note(self.col.models.by_name('Basic'))
@@ -86,6 +92,7 @@ class Integration(unittest.TestCase):
         engine.session_for(self.col.sched).rng = random.Random(12345)
 
     def tearDown(self):
+        aqt.mw = None
         self.col.close()
         self.tmp.cleanup()
 
@@ -126,6 +133,105 @@ class Integration(unittest.TestCase):
             session.rng.seed(seed)
             firsts.add(self.col.sched.get_queued_cards().cards[0].card.id)
         self.assertEqual(firsts, set(self.ids))
+
+    def show(self, queued):
+        # The final display can differ from the first scheduler suggestion.
+        card = Card(self.col, backend_card=queued.card)
+        gui_hooks.reviewer_did_show_question(card)
+        return card
+
+    def reopen(self, did=None):
+        changes = self.col._backend.set_current_deck(did or self.deck_id)
+        gui_hooks.operation_did_execute(changes, None)
+        return self.col.sched.get_queued_cards()
+
+    def test_resume_final_displayed_card_all_card_types(self):
+        for kind in (0, 1, 2, 3):
+            with self.subTest(kind=kind):
+                queue = self.col.sched.get_queued_cards(fetch_limit=100)
+                q = next(q for q in reversed(queue.cards) if q.card.ctype == kind)
+                self.show(q)
+                before = self.col.db.all('select * from cards order by id')
+                for _ in range(5):
+                    self.assertEqual(self.reopen().cards[0].card.id, q.card.id)
+                self.assertEqual(before, self.col.db.all('select * from cards order by id'))
+        self.assertEqual(self.col.db.scalar('select count(*) from revlog'), 0)
+
+    def test_resume_survives_visiting_another_deck(self):
+        q = self.col.sched.get_queued_cards().cards[0]
+        self.show(q)
+        self.reopen(1)
+        self.assertEqual(self.reopen().cards[0].card.id, q.card.id)
+
+    def test_resume_is_independent_for_two_filtered_decks(self):
+        first = self.col.sched.get_queued_cards().cards[0]
+        self.show(first)
+        for index in range(3):
+            note = self.col.new_note(self.col.models.by_name('Basic'))
+            note['Front'] = f'Second deck {index}'
+            self.col.add_note(note, 1)
+        deck = self.col.sched.get_or_create_filtered_deck(0)
+        deck.name = 'Second synthetic filtered'
+        deck.config.search_terms[0].search = 'deck:Default'
+        del deck.config.search_terms[1:]
+        other = self.col.sched.add_or_update_filtered_deck(deck).id
+        engine.set_enabled(self.col, other, True)
+        second = self.reopen(other).cards[0]
+        self.show(second)
+        self.assertEqual(self.reopen().cards[0].card.id, first.card.id)
+        self.assertEqual(self.reopen(other).cards[0].card.id, second.card.id)
+        self.answer(second, CardAnswer.EASY)
+        self.col.undo()
+        self.assertEqual(self.reopen().cards[0].card.id, first.card.id)
+
+    def test_resume_does_not_pin_answered_card(self):
+        q = self.col.sched.get_queued_cards().cards[0]
+        self.show(q)
+        self.assertIn(self.deck_id, engine.session_for(self.col.sched).pending)
+        self.answer(q, CardAnswer.EASY)
+        self.assertNotIn(self.deck_id, engine.session_for(self.col.sched).pending)
+        self.assertNotEqual(self.reopen().cards[0].card.id, q.card.id)
+        self.col.undo()
+        self.assertEqual(self.reopen().cards[0].card.id, q.card.id)
+
+    def test_resume_discards_unavailable_and_rescheduled_cards(self):
+        for change in ('bury', 'suspend', 'delete', 'future'):
+            with self.subTest(change=change):
+                q = self.col.sched.get_queued_cards().cards[0]
+                self.show(q)
+                cid = q.card.id
+                if change == 'bury':
+                    self.col.sched.bury_cards([cid])
+                elif change == 'suspend':
+                    self.col.sched.suspend_cards([cid])
+                elif change == 'delete':
+                    self.col.remove_notes([q.card.note_id])
+                else:
+                    card = self.col.get_card(cid)
+                    card.type = card.queue = 1
+                    card.due = int(time.time())+600
+                    card.left = 2002
+                    self.col.update_card(card)
+                self.assertNotEqual(self.reopen().cards[0].card.id, cid)
+                self.assertNotIn(self.deck_id, engine.session_for(self.col.sched).pending)
+
+    def test_resume_survives_text_edit_but_not_schedule_edit(self):
+        q = self.col.sched.get_queued_cards().cards[0]
+        self.show(q)
+        note = self.col.get_note(q.card.note_id)
+        note['Front'] += ' edited'
+        self.col.update_note(note)
+        self.assertEqual(self.reopen().cards[0].card.id, q.card.id)
+        card = self.col.get_card(q.card.id)
+        card.reps += 1
+        self.col.update_card(card)
+        self.reopen()
+        self.assertNotIn(self.deck_id, engine.session_for(self.col.sched).pending)
+
+    def test_count_queries_do_not_create_resume_state(self):
+        self.col.sched.get_queued_cards(fetch_limit=0)
+        self.col.sched.get_queued_cards(fetch_limit=100)
+        self.assertFalse(engine.session_for(self.col.sched).pending)
 
     def test_fetch_does_not_modify_cards_or_undo(self):
         before = self.col.db.all('select * from cards order by id')
@@ -298,7 +404,10 @@ class Integration(unittest.TestCase):
             self.assertEqual(q.context, expected[q.card.id].context)
             self.assertEqual(q.states, expected[q.card.id].states)
         target = next(q for q in custom.cards if q.card.ctype == 2)
-        self.answer(target)
+        self.show(target)
+        resumed = self.reopen().cards[0]
+        self.assertEqual(resumed, target)
+        self.answer(resumed)
         self.col.undo()
 
     def test_full_pool_over_1000_cards(self):
@@ -378,10 +487,6 @@ class Integration(unittest.TestCase):
             addon.on_saved(dialog, dialog.deck, self.deck_id)
             self.assertEqual(before_config, self.col.get_config(engine.CONFIG_KEY))
         finally:
-            gui_hooks.filtered_deck_dialog_did_load_deck.remove(addon.on_load)
-            gui_hooks.filtered_deck_dialog_will_add_or_update_deck.remove(addon.on_will_save)
-            gui_hooks.filtered_deck_dialog_did_add_or_update_deck.remove(addon.on_saved)
-            gui_hooks.operation_did_execute.remove(addon.on_operation)
             dialog.hide()
             dialog.deleteLater()
 
